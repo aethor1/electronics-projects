@@ -1,0 +1,16 @@
+.pio/
+.vscode/
+__pycache__/
+backups/
+data/
+logs/
+/vendor/
+/lib/lvgl/
+*.bin
+*.elf
+*.o
+*.mp3
+.env
+.env.*
+secrets.h
+

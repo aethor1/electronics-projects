@@ -9,6 +9,7 @@ Arduino and ESP32 projects built with PlatformIO.
 | [ESP32 Temperature and Humidity Display](esp32-oled-dht11/) | ESP32 DOIT DevKit V1 | Prototype |
 | [Servo Test](servo-test/) | ESP32 DOIT DevKit V1 | Starter |
 | [ESP32 Switch and LED Test](wifi-test/) | ESP32 DOIT DevKit V1 | Work in progress |
+| [Touchscreen MP3 Player](waveshare-mp3-player/) | Waveshare ESP32-S3-Touch-LCD-2.8 | SD playback, touch controls, and stock speaker verified |
 
 Each project has its own source, configuration, dependencies, and README. Open the individual project folder in PlatformIO to build it.
 
