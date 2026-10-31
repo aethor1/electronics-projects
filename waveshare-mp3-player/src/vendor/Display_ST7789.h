@@ -18,11 +18,11 @@
 #define EXAMPLE_PIN_NUM_LCD_RST        39
 
 #define LCD_Backlight_PIN   5
-#define PWM_Channel     1       // PWM Channel   
-#define Frequency       20000   // PWM frequencyconst        
+#define PWM_Channel     1       // PWM Channel
+#define Frequency       20000   // PWM frequencyconst
 #define Resolution      10       // PWM resolution ratio     MAX:13
-#define Dutyfactor      500     // PWM Dutyfactor      
-#define Backlight_MAX   100      
+#define Dutyfactor      500     // PWM Dutyfactor
+#define Backlight_MAX   100
 
 #define VERTICAL   0
 #define HORIZONTAL 1
@@ -41,3 +41,4 @@ void LCD_addWindow(uint16_t Xstart, uint16_t Ystart, uint16_t Xend, uint16_t Yen
 
 void Backlight_Init(void);
 void Set_Backlight(uint8_t Light);
+void LCD_SetSleep(bool asleep);

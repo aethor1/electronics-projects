@@ -11,7 +11,7 @@
 #define I2C_MASTER_FREQ_HZ  400000                     /*!< I2C master clock frequency */
 
 
-#define CST328_LCD_TOUCH_MAX_POINTS             (5)      
+#define CST328_LCD_TOUCH_MAX_POINTS             (5)
 /* CST328 registers */
 #define ESP_LCD_TOUCH_CST328_READ_Number_REG    (0xD005)
 #define ESP_LCD_TOUCH_CST328_READ_XY_REG        (0xD000)
@@ -23,7 +23,7 @@
 #define HYN_REG_MUT_DEBUG_INFO_IC_CHECKSUM      0xD208
 #define HYN_REG_MUT_DEBUG_INFO_FW_VERSION       0xD204
 #define HYN_REG_MUT_DEBUG_INFO_IC_TYPE			    0xD202
-#define HYN_REG_MUT_DEBUG_INFO_PROJECT_ID			  0xD200 
+#define HYN_REG_MUT_DEBUG_INFO_PROJECT_ID			  0xD200
 #define HYN_REG_MUT_DEBUG_INFO_BOOT_TIME        0xD1FC
 #define HYN_REG_MUT_DEBUG_INFO_RES_Y            0xD1FA
 #define HYN_REG_MUT_DEBUG_INFO_RES_X            0xD1F8
@@ -54,7 +54,9 @@
 
 #define interrupt RISING
 
-extern uint8_t Touch_interrupts;
+extern volatile uint8_t Touch_interrupts;
+bool Touch_ConsumeInterrupt();
+void Touch_SetWakeTask(TaskHandle_t task);
 
 struct CST328_Touch{
   uint8_t points;    // Number of touch points
