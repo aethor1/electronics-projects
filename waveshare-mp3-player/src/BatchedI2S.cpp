@@ -52,7 +52,7 @@ size_t BatchedI2S::write(const uint8_t *data, size_t bytes) {
 bool BatchedI2S::ConsumeSample(int16_t sample[2]) {
     if(!active_ || failed() || !budget_) return false;
     const int16_t right=channels==1 ? sample[0] : sample[1];
-    const uint32_t packed=player::packPcm(sample[0],right,gainF2P6,true);
+    const uint32_t packed=player::packPcm(sample[0],right,gainF2P6,player::kMonoOutput);
     if(!batch_.push(packed,[this](const uint8_t *data,size_t bytes){return write(data,bytes);})) return false;
     --budget_; ++frames_;
     return true;

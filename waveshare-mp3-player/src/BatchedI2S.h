@@ -11,6 +11,10 @@ public:
     bool begin() override;
     bool SetRate(int hz) override;
     bool SetBitsPerSample(int bits) override { if(bits!=16) return false; bps=bits; return true; }
+    // ESP8266Audio's SetGain wraps 4.0 to 0; clamp to this build's configured gain instead.
+    bool SetGain(float f) override {
+        const float q=f*64.0f; gainF2P6=q<=0 ? 0 : q>=player::kGainQ6 ? player::kGainQ6 : uint8_t(q); return true;
+    }
     bool SetChannels(int count) override { if(count!=1 && count!=2) return false; channels=count; return true; }
     bool ConsumeSample(int16_t sample[2]) override;
     bool stop() override;

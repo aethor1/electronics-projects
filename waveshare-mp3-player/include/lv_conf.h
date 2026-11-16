@@ -9,6 +9,7 @@
 #define LV_TICK_CUSTOM 1
 #define LV_TICK_CUSTOM_INCLUDE "Arduino.h"
 #define LV_TICK_CUSTOM_SYS_TIME_EXPR (millis())
+#define LV_FONT_MONTSERRAT_12 1
 #define LV_FONT_MONTSERRAT_14 1
 #define LV_FONT_MONTSERRAT_16 1
 #define LV_FONT_MONTSERRAT_20 1
@@ -19,4 +20,5 @@
 #define LV_BUILD_EXAMPLES 0
 #define LV_USE_DEMO_WIDGETS 0
 #define LV_USE_DEMO_MUSIC 0
+#define LV_USE_QRCODE 1 // Wi-Fi join + upload page codes
 #endif

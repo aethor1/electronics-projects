@@ -56,7 +56,8 @@ void worker(void *) {
         strlcpy(state.error,message,sizeof(state.error));
     };
     auto start=[&](const char *path,bool sd) {
-        stop(); state=AudioState{}; state.sd=sd;
+        const uint32_t releases=state.releases;
+        stop(); state=AudioState{}; state.sd=sd; state.releases=releases;
         strlcpy(state.path,path,sizeof(state.path));
         source=sd ? &sdSource : &flashSource;
         activeMs=0; lastTick=millis();
@@ -79,7 +80,9 @@ void worker(void *) {
         lastTick=now;
         if(received) {
             do {
-                if(command.action==START) start(command.path,command.sd);
+                if(command.action==RELEASE) {
+                    stop(); state.running=false; state.paused=false; ++state.releases;
+                } else if(command.action==START) start(command.path,command.sd);
                 else if(!state.running && state.path[0] && command.action!=PAUSE) {
                     char path[player::kMaxPath]; strlcpy(path,state.path,sizeof(path));
                     const bool sd=state.sd; start(path,sd);

@@ -1,4 +1,6 @@
 #include "PlayerCore.h"
+#include "TransferCore.h"
+#include "ButtonCore.h"
 #include "BatchedI2S.h"
 #include "vendor/Display_ST7789.h"
 #include <algorithm>
@@ -124,7 +126,7 @@ static void testActualAudioOutput() {
         for(unsigned i=0;i<44100;++i) {
             if(i%player::kPcmSliceFrames==0) output.beginSlice();
             int16_t sample[2]={int16_t(i*17),int16_t(-int(i*11))};
-            const uint32_t packed=player::packPcm(sample[0],sample[1],player::kGainQ6,true);
+            const uint32_t packed=player::packPcm(sample[0],sample[1],player::kGainQ6,player::kMonoOutput);
             const auto *bytes=reinterpret_cast<const uint8_t*>(&packed); expected.insert(expected.end(),bytes,bytes+4);
             check(output.ConsumeSample(sample),"actual audio accepts a valid slice");
         }
@@ -170,7 +172,51 @@ static void testActualLcd() {
     check(mockTime-at>=120,"LCD wake honors stabilization delay");
     std::cout<<"lcd_transactions_per_rect=1 baseline=12\n";
 }
+static void testTransfer() {
+    using namespace player;
+    check(sanitizeUploadName("Malcolm Todd - Chest Pain.mp3")=="Malcolm Todd - Chest Pain.mp3","plain names unchanged");
+    check(sanitizeUploadName("a/b\\c:d*e?.MP3")=="c_d_e_.mp3","paths stripped, FAT-illegal chars replaced");
+    check(sanitizeUploadName("Beyonc\xc3\xa9.mp3")=="Beyonc__.mp3","each non-ASCII byte becomes one underscore");
+    check(sanitizeUploadName("  ..song.. .mp3")=="song.mp3","leading/trailing spaces and dots trimmed");
+    check(sanitizeUploadName(".mp3")=="song.mp3" && sanitizeUploadName("")=="song.mp3","empty names get a default");
+    check(sanitizeUploadName(std::string(200,'x')+".mp3").size()==100,"long names capped at 96+4 bytes");
+    check(sanitizeUploadName("track.wav")=="track.wav.mp3","non-MP3 extension kept inside the stem");
+    const std::string once=sanitizeUploadName("We\xe2\x80\x99re \"Live\" | 2024.mp3");
+    check(sanitizeUploadName(once)==once,"sanitizing is idempotent (Mac and player agree)");
+    check(hasMp3Extension("x.Mp3") && !hasMp3Extension("x.mp4") && !hasMp3Extension("mp3"),"extension check");
+    check(numberedName("Song.mp3",1)=="Song.mp3" && numberedName("Song.mp3",3)=="Song (3).mp3","collision names");
+    check(wifiQrPayload("Addy's MP3-Player","whyisadityasupercool")=="WIFI:T:WPA;S:Addy's MP3-Player;P:whyisadityasupercool;;","Wi-Fi QR payload");
+    check(wifiQrEscape("a;b,c:d\"e\\")=="a\\;b\\,c\\:d\\\"e\\\\","Wi-Fi QR escaping");
+    check(jsonEscape("a\"b\\c\n")=="a\\\"b\\\\c\\u000a","JSON escaping");
+    check(!sessionExpired(299999,0,300000) && sessionExpired(300000,0,300000),"5 minute idle timeout");
+    check(sessionExpired(1000,UINT32_MAX-298999,300000),"idle timeout handles millis wrap");
+    check(sessionSecondsLeft(0,0,300000)==300 && sessionSecondsLeft(299001,0,300000)==1,"countdown rounds up");
+}
+static void testButtons() {
+    using namespace player;
+    const ButtonTiming t{25,350,700};
+    auto run=[&](ButtonGesture &b,std::vector<std::pair<uint32_t,bool>> edges,uint32_t until){
+        std::vector<ButtonEvent> events; bool level=false; size_t next=0;
+        for(uint32_t now=0;now<=until;now+=5) {
+            while(next<edges.size() && edges[next].first<=now) level=edges[next++].second;
+            const ButtonEvent e=b.update(level,now); if(e!=ButtonEvent::None) events.push_back(e);
+        }
+        return events;
+    };
+    { ButtonGesture b(t); auto e=run(b,{{100,true},{200,false}},1200);
+      check(e.size()==1 && e[0]==ButtonEvent::Single,"single click after double window"); }
+    { ButtonGesture b(t); auto e=run(b,{{100,true},{180,false},{300,true},{380,false}},1500);
+      check(e.size()==1 && e[0]==ButtonEvent::Double,"double click"); }
+    { ButtonGesture b(t); auto e=run(b,{{100,true},{1000,false}},2000);
+      check(e.size()==1 && e[0]==ButtonEvent::Long,"long press, release ignored"); }
+    { ButtonGesture b(t); auto e=run(b,{{100,true},{105,false},{110,true},{115,false},{120,true},{220,false}},1200);
+      check(e.size()==1 && e[0]==ButtonEvent::Single,"contact bounce debounced"); }
+    { ButtonGesture b(t,true); auto e=run(b,{{100,true},{200,false},{300,true},{400,false}},1200);
+      check(e.size()==2 && e[0]==ButtonEvent::Single && e[1]==ButtonEvent::Single,"immediate-single mode"); }
+    { ButtonGesture b(t); auto e=run(b,{{100,true},{180,false},{800,true},{880,false}},2000);
+      check(e.size()==2 && e[0]==ButtonEvent::Single && e[1]==ButtonEvent::Single,"slow clicks are two singles"); }
+}
 int main() {
-    testPolicy(); testTags(); testReadAhead(); testBatch(); testPcm(); testActualAudioOutput(); testActualLcd();
-    std::cout<<"PASS: core, PCM fidelity, short writes, I2S lifecycle, ID3 bounds, read-ahead, sleep/wake, LCD protocol\n";
+    testPolicy(); testTags(); testReadAhead(); testBatch(); testPcm(); testActualAudioOutput(); testActualLcd(); testTransfer(); testButtons();
+    std::cout<<"PASS: core, PCM fidelity, short writes, I2S lifecycle, ID3 bounds, read-ahead, sleep/wake, LCD protocol, upload names, buttons\n";
 }

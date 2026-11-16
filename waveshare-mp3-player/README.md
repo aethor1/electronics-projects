@@ -1,5 +1,9 @@
 # Waveshare touchscreen MP3 player
 
+**Feature branch `feature/wifi-usb-upload`:** Wi-Fi upload with QR codes, USB drive
+mode, two physical buttons, an earbuds build, and a Mac companion app. Compile and
+host-test checked only; see [ADD-MUSIC.md](ADD-MUSIC.md) and [mac-app](mac-app/README.md).
+
 **Local optimization branch:** the current changes are build/host-test checked,
 but have **not been flashed, tested on hardware, or pushed**. The physically
 verified GitHub baseline is commit `8f0333769c7bcc9d86802dd16cfc0da48240266f`.

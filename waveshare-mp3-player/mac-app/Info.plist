@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Send to MP3 Player</string>
+    <key>CFBundleDisplayName</key>
+    <string>Send to MP3 Player</string>
+    <key>CFBundleIdentifier</key>
+    <string>local.addy.sendtomp3</string>
+    <key>CFBundleExecutable</key>
+    <string>SendToMP3</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.music</string>
+    <!-- The player's upload page is plain HTTP on its own Wi-Fi (192.168.4.1). -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+    </dict>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Sends songs to the MP3 player over its Wi-Fi.</string>
+    <key>NSLocationUsageDescription</key>
+    <string>macOS needs this to join the MP3 player's Wi-Fi automatically.</string>
+</dict>
+</plist>
