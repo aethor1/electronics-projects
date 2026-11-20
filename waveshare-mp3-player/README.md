@@ -1,9 +1,32 @@
 # Waveshare touchscreen MP3 player
 
+**Feature branch `feature/wifi-usb-upload`:** Wi-Fi upload with QR codes, USB drive
+mode, two physical buttons, an earbuds build, and a Mac companion app. `241abed` boots and
+plays on the board. **2026-11-20 update (not flashed yet):** upload-page fix (DNS +
+connectivity probes), on-screen volume saved across reboots, redesigned UI. What changed and
+what to check on the board: [ADD-MUSIC.md](ADD-MUSIC.md#2026-11-20-update-what-changed).
+
+![New UI, rendered from the firmware's UI code on a PC](docs/ui/overview.png)
+
+UI screenshots: `python tools/ui_preview/run.py` builds `src/PlayerUi.cpp` + LVGL on Linux with a
+dummy display and writes `docs/ui/*.png` (2x pixel-doubled).
+
+**Local optimization branch:** the current changes are build/host-test checked,
+but have **not been flashed, tested on hardware, or pushed**. The physically
+verified GitHub baseline is commit `8f0333769c7bcc9d86802dd16cfc0da48240266f`.
+See [optimization results and hardware checks](OPTIMIZATION.md).
+
+The new code dims the screen after 15 seconds, puts the LCD/backlight to sleep
+after 30 seconds, and uses the first touch only to wake it. Music continues.
+It batches PCM output, blocks the audio task while paused, caches unchanged UI
+text, uses interrupt-driven touch with a fallback poll, and creates screenshot
+memory only on demand. Normal boots use existing SD songs without rehashing the
+internal test copy. These are code changes, **not measured battery-life claims**.
+
 Working USB-powered prototype for the **Waveshare ESP32-S3-Touch-LCD-2.8**:
 240 x 320 touchscreen, microSD music storage, and the included speaker.
 
-## Confirmed on hardware
+## Baseline confirmed on hardware (before these local changes)
 
 - Screen text/colors, touch navigation, speaker playback, and pause/resume work.
 - Player / Files / Storage tabs show the current song, files, and card space.
@@ -84,7 +107,10 @@ python prepare_vendor.py --archive path\to\waveshare-v2-demo.zip
 `patch_audio_library.py` makes an idempotent local change to ESP8266Audio 1.9.7:
 disable the unused I2S MCLK output so GPIO0 remains available for BOOT. Run the
 patch again if the dependency is reinstalled. No generated song is included.
-The source/configuration here match the final physically verified build.
+The optimization branch has additional local changes; the baseline commit above
+preserves the exact source of the physically verified build. The new I2S adapter
+sets the unused MCLK to `I2S_PIN_NO_CHANGE` directly; the legacy dependency patch
+is retained for reproducing the baseline and is not required by the new adapter.
 
 Do **not** upload a filesystem image just to play songs already on the card.
 Only to reproduce the original internal-flash test, provide your own exact
@@ -111,7 +137,8 @@ python inspect_player.py --port COM15 --command storage --screenshot logs\storag
 ```
 
 Commands: `status`, `pause`, `play`, `next`, `prev`, `player`, `files`, `music`,
-`storage`, `shot`. The helper captures rendered pixels; a PNG alone does not
+`storage`, `shot`, `metrics`, `screen-off`, `wake` (plus the Add-music ones in ADD-MUSIC.md). Status output is now requested
+explicitly, without periodic logging. The helper captures rendered pixels; a PNG alone does not
 prove the physical display works. Audio, touch, and the final LCD fix were also
 confirmed by the user. Helpers close the serial port when finished.
 

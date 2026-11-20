@@ -13,8 +13,8 @@ static uint8_t Touch_controller = 0;
 bool Touch_I2C_Read(uint8_t Driver_addr, uint16_t Reg_addr, uint8_t *Reg_data, uint32_t Length)
 {
   Wire1.beginTransmission(Driver_addr);
-  Wire1.write((uint8_t)(Reg_addr >> 8)); 
-  Wire1.write((uint8_t)Reg_addr);        
+  Wire1.write((uint8_t)(Reg_addr >> 8));
+  Wire1.write((uint8_t)Reg_addr);
   if ( Wire1.endTransmission(true)){
     Serial.printf("The I2C transmission fails. - Touch I2C Read\r\n");
     return false;
@@ -32,8 +32,8 @@ bool Touch_I2C_Read(uint8_t Driver_addr, uint16_t Reg_addr, uint8_t *Reg_data, u
 bool Touch_I2C_Write(uint8_t Driver_addr, uint16_t Reg_addr, const uint8_t *Reg_data, uint32_t Length)
 {
   Wire1.beginTransmission(Driver_addr);
-  Wire1.write((uint8_t)(Reg_addr >> 8)); 
-  Wire1.write((uint8_t)Reg_addr);        
+  Wire1.write((uint8_t)(Reg_addr >> 8));
+  Wire1.write((uint8_t)Reg_addr);
   for (int i = 0; i < Length; i++) {
     Wire1.write(*Reg_data++);
   }
@@ -113,6 +113,7 @@ uint16_t CST328_Read_cfg(void) {
 // reads sensor and touches
 // updates Touch Points, but if not touched, resets all Touch Point Information
 uint8_t Touch_Read_Data(void) {
+  touch_data.points = 0; // A failed/no-touch read must never reuse an old press.
   if (Touch_controller == TOUCH_CONTROLLER_CST3530) {
     return Touch2_Read_Data();
   }
@@ -128,7 +129,7 @@ uint8_t Touch_Read_Data(void) {
   if (!Touch_I2C_Read(CST328_ADDR, ESP_LCD_TOUCH_CST328_READ_Number_REG, buf, 1)) {
     return false;
   }
-  if ((buf[0] & 0x0F) == 0x00) {                                              
+  if ((buf[0] & 0x0F) == 0x00) {
     Touch_I2C_Write(CST328_ADDR, ESP_LCD_TOUCH_CST328_READ_Number_REG, &clear, 1);  // No touch data
   } else {
     /* Count of touched points */
@@ -145,7 +146,7 @@ uint8_t Touch_Read_Data(void) {
     /* Clear all */
     Touch_I2C_Write(CST328_ADDR, ESP_LCD_TOUCH_CST328_READ_Number_REG, &clear, 1);
     // Serial.printf(" points=%d \r\n",touch_cnt);
-    noInterrupts(); 
+    noInterrupts();
     /* Number of touched points */
     if(touch_cnt > CST328_LCD_TOUCH_MAX_POINTS)
         touch_cnt = CST328_LCD_TOUCH_MAX_POINTS;
@@ -153,11 +154,11 @@ uint8_t Touch_Read_Data(void) {
     /* Fill all coordinates */
     for (i = 0; i < touch_cnt; i++) {
       if(i>0) num = 2;
-      touch_data.coords[i].x = (uint16_t)(((uint16_t)buf[(i * 5) + 2 + num] << 4) + ((buf[(i * 5) + 4 + num] & 0xF0)>> 4));               
+      touch_data.coords[i].x = (uint16_t)(((uint16_t)buf[(i * 5) + 2 + num] << 4) + ((buf[(i * 5) + 4 + num] & 0xF0)>> 4));
       touch_data.coords[i].y = (uint16_t)(((uint16_t)buf[(i * 5) + 3 + num] << 4) + ( buf[(i * 5) + 4 + num] & 0x0F));
       touch_data.coords[i].strength = ((uint16_t)buf[(i * 5) + 5 + num]);
     }
-    interrupts(); 
+    interrupts();
     // Serial.printf(" points=%d \r\n",touch_data.points);
   }
   return true;
@@ -184,7 +185,7 @@ uint8_t Touch_Get_XY(uint16_t *x, uint16_t *y, uint16_t *strength, uint8_t *poin
   assert(y != NULL);
   assert(point_num != NULL);
   assert(max_point_num > 0);
-  
+
   noInterrupts();
   /* Count of points */
   if(touch_data.points > max_point_num)
@@ -221,7 +222,21 @@ void example_touchpad_read(void){
 /*!
     @brief  handle interrupts
 */
-uint8_t Touch_interrupts;
+volatile uint8_t Touch_interrupts;
+static TaskHandle_t wake_task = nullptr;
+bool Touch_ConsumeInterrupt() {
+  noInterrupts();
+  const bool pending = Touch_interrupts != 0;
+  Touch_interrupts = 0;
+  interrupts();
+  return pending;
+}
+void Touch_SetWakeTask(TaskHandle_t task) { wake_task = task; }
 void IRAM_ATTR Touch_CST328_ISR(void) {
   Touch_interrupts = true;
+  if (wake_task) {
+    BaseType_t awoken = pdFALSE;
+    vTaskNotifyGiveFromISR(wake_task, &awoken);
+    if (awoken) portYIELD_FROM_ISR();
+  }
 }

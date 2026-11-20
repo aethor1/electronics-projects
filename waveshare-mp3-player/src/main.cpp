@@ -2,27 +2,34 @@
 // preserved in backups/. No battery/charging/headphone circuit is changed.
 #include <Arduino.h>
 #include <LittleFS.h>
+#include <Preferences.h>
 #include <SD_MMC.h>
 #include <lvgl.h>
-#include <AudioFileSourceFS.h>
-#include <AudioFileSourceID3.h>
-#include <AudioFileSourceBuffer.h>
-#include <AudioGeneratorMP3.h>
-#include <AudioOutputI2S.h>
 #include <mbedtls/sha256.h>
-#include <driver/i2s.h>
 #include <vector>
 #include <algorithm>
+#include <string>
+#include "AudioEngine.h"
+#include "ButtonCore.h"
+#include "PlayerCore.h"
+#include "PlayerUi.h"
+#include "TransferCore.h"
+#include "UsbDrive.h"
+#include "WifiUpload.h"
 #include "vendor/Display_ST7789.h"
 
 static bool sdReady, flashReady, copiedSong;
 static uint64_t sdTotal, sdUsed;
 static String importPath, importResult;
 static constexpr char expectedHash[] = "700c4d7edc15c1d1a1fd8d69c93a7ae282ffd17c1aa626594aa25329b99adf18";
-static lv_obj_t *tabs, *titleLabel, *pathLabel, *stateLabel, *positionBar;
-static lv_obj_t *playText, *browserList, *folderLabel, *fileCountLabel;
+// Imports and hashing are boot-only, so they can share one scratch block.
+static uint8_t fileScratch[4096];
+static lv_indev_t *touchDevice;
 static uint16_t *screenPixels;
-static uint32_t flushCount, touchCount;
+static uint32_t flushCount, touchCount, lastActivity, lastTouchProbe, readyMs;
+static bool physicalTouch, uiReady, booting=true, audioReady, scanLimited;
+static player::ScreenMode screenMode=player::ScreenMode::Awake;
+static player::WakeGesture wakeGesture;
 static lv_disp_draw_buf_t drawBuffer;
 static lv_color_t drawPixels[240 * 24];
 struct Track { String path; bool sd; };
@@ -31,39 +38,42 @@ static std::vector<Track> tracks;
 static std::vector<Entry> entries;
 static int selectedTrack = 0;
 static String folder = "/";
-enum Action : uint8_t { START, TOGGLE, PAUSE, RESUME };
-struct AudioCommand { Action action; bool sd; char path[256]; };
-struct AudioState {
-    bool running, paused, sd, failed;
-    uint32_t bytes, position, elapsed;
-    char path[256];
-};
-static AudioState audioState = {};
-static SemaphoreHandle_t stateLock;
-static QueueHandle_t commands;
-static String basenameOf(String path) { return path.substring(path.lastIndexOf('/') + 1); }
-static bool isMp3(String path) { path.toLowerCase(); return path.endsWith(".mp3"); }
-static AudioState snapshot() {
-    xSemaphoreTake(stateLock, portMAX_DELAY);
-    AudioState s = audioState;
-    xSemaphoreGive(stateLock);
-    return s;
+// Add music: Wi-Fi upload or USB drive. While either is active, playback controls,
+// the file browser and the buttons are ignored, and the screen stays awake.
+enum class Transfer : uint8_t { None, Wifi, Usb };
+static Transfer transfer=Transfer::None, transferRequest=Transfer::None;
+static bool transferExitRequested, usbCancelArmed;
+static uint32_t transferStartedAt, transferUiAt, usbEjectedAt;
+static TaskHandle_t uiTaskHandle;
+// On-screen volume, saved in NVS 1.5 s after the last change (not on every slider step).
+// Earbuds use their own key, so a speaker-build level never carries over.
+static Preferences prefs;
+static const char *const kVolumeKey = PLAYER_EARBUDS ? "vol_ear" : "vol";
+static uint8_t volumeLevel = player::kDefaultVolume;
+static bool volumeDirty;
+static uint32_t volumeChangedAt;
+static String basenameOf(const String &path) { return path.substring(path.lastIndexOf('/') + 1); }
+static bool isMp3(const String &path) {
+    const unsigned n=path.length();
+    return n>=4 && path[n-4]=='.' && (path[n-3]=='m'||path[n-3]=='M') &&
+           (path[n-2]=='p'||path[n-2]=='P') && path[n-1]=='3';
 }
+static AudioState snapshot() { return audioSnapshot(); }
+static void bootService() { if(uiReady) lv_timer_handler(); delay(1); }
 static String hashFile(fs::FS &fs, const char *path) {
     File file = fs.open(path, FILE_READ);
     if (!file || file.isDirectory()) return "";
     mbedtls_sha256_context ctx;
     mbedtls_sha256_init(&ctx);
     mbedtls_sha256_starts_ret(&ctx, 0);
-    static uint8_t data[4096];
     uint8_t digest[32];
     size_t count = 0;
     while (file.available()) {
-        int n = file.read(data, sizeof(data));
+        int n = file.read(fileScratch, sizeof(fileScratch));
         if (n <= 0) break;
         count += n;
-        mbedtls_sha256_update_ret(&ctx, data, n);
-        delay(0);
+        mbedtls_sha256_update_ret(&ctx, fileScratch, n);
+        bootService();
     }
     bool complete = count == file.size();
     file.close();
@@ -108,11 +118,10 @@ static void importSong() {
     File dest = SD_MMC.open(temp, FILE_WRITE);
     if (!dest) { source.close(); importResult = "Card is not writable."; return; }
     size_t expected = source.size(), written = 0;
-    static uint8_t buffer[4096];
     while (source.available()) {
-        int n = source.read(buffer, sizeof(buffer));
-        if (n <= 0 || dest.write(buffer, n) != size_t(n)) break;
-        written += n; delay(0);
+        int n = source.read(fileScratch, sizeof(fileScratch));
+        if (n <= 0 || dest.write(fileScratch, n) != size_t(n)) break;
+        written += n; bootService();
     }
     dest.flush(); dest.close(); source.close();
     if (written != expected || hashFile(SD_MMC, temp.c_str()) != expectedHash) {
@@ -125,92 +134,65 @@ static void importSong() {
     importResult = "Song copied to SD; SHA-256 verified.";
     Serial.printf("SD_COPY_VERIFIED path=%s bytes=%u sha256=%s\n", target.c_str(), unsigned(written), expectedHash);
 }
+static uint32_t scanStartedAt, scannedEntries;
+static bool musicScanned;
 static void scanMusic(const String &path, int depth=0) {
-    if (depth > 4 || tracks.size() >= 128) return;
+    if (depth > int(player::kMaxScanDepth) || tracks.size() >= player::kMaxTracks) return;
+    if(path.equalsIgnoreCase("/Music")) {
+        if(musicScanned) return;
+        musicScanned=true;
+    }
     File directory = SD_MMC.open(path);
     if (!directory || !directory.isDirectory()) return;
     File file;
-    while ((file = directory.openNextFile()) && tracks.size() < 128) {
+    while (tracks.size() < player::kMaxTracks && (file = directory.openNextFile())) {
+        if (++scannedEntries > player::kMaxScanEntries || millis()-scanStartedAt >= player::kMaxScanMs) {
+            scanLimited=true; file.close(); break;
+        }
         String full = path == "/" ? "/" + basenameOf(file.name()) : path + "/" + basenameOf(file.name());
         bool subdir = file.isDirectory(); file.close();
-        if (subdir && !basenameOf(full).startsWith(".")) scanMusic(full, depth+1);
-        else if (!subdir && isMp3(full)) tracks.push_back({full, true});
+        // Skip dot entries: macOS copies leave "._Song.mp3" metadata files that are not MP3s.
+        const bool hidden = basenameOf(full).startsWith(".");
+        if (subdir && !hidden) scanMusic(full, depth+1);
+        else if (!subdir && !hidden && isMp3(full)) tracks.push_back({full, true});
+        if (scannedEntries%16==0) bootService();
     }
     directory.close();
 }
-static void audioTask(void *) {
-    AudioFileSourceFS *source = nullptr;
-    AudioFileSourceID3 *tags = nullptr;
-    AudioFileSourceBuffer *buffer = nullptr;
-    AudioGeneratorMP3 *decoder = nullptr;
-    AudioOutputI2S output(0, AudioOutputI2S::EXTERNAL_I2S, 8, AudioOutputI2S::APLL_DISABLE);
-    output.SetPinout(48, 38, 47); output.SetGain(0.08f); output.SetOutputModeMono(true);
-    AudioState state = {};
-    uint32_t lastTick = millis(), activeMs = 0, publishAt = 0;
-    auto stop = [&]() {
-        if (decoder) {
-            decoder->stop();
-            // The pinned output library stops DMA but retains the driver.
-            // Release it before restarting another track on the same I2S port.
-            i2s_driver_uninstall(I2S_NUM_0);
-        }
-        delete decoder; decoder = nullptr;
-        delete buffer; buffer = nullptr;
-        delete tags; tags = nullptr;
-        delete source; source = nullptr;
-    };
-    auto start = [&](const char *path, bool sd) {
-        stop(); state = {}; state.sd = sd;
-        strlcpy(state.path, path, sizeof(state.path));
-        fs::FS &fs = sd ? static_cast<fs::FS&>(SD_MMC) : static_cast<fs::FS&>(LittleFS);
-        source = new AudioFileSourceFS(fs, path);
-        if (source->isOpen()) {
-            state.bytes = source->getSize();
-            tags = new AudioFileSourceID3(source);
-            buffer = new AudioFileSourceBuffer(tags, 16384);
-            decoder = new AudioGeneratorMP3();
-            state.running = decoder->begin(buffer, &output);
-        }
-        state.failed = !state.running; activeMs = 0; lastTick = millis();
-        Serial.printf("AUDIO_START storage=%s path=%s bytes=%u decoder=%s\n", sd ? "microSD" : "internal", path, state.bytes, state.running ? "OK" : "FAILED");
-    };
-    for (;;) {
-        AudioCommand c;
-        while (xQueueReceive(commands, &c, 0) == pdTRUE) {
-            if (c.action == START) start(c.path, c.sd);
-            else if (!state.running && state.path[0] && c.action != PAUSE) {
-                char path[256]; strlcpy(path, state.path, sizeof(path)); bool sd = state.sd; start(path, sd);
-            } else if (state.running) {
-                if (c.action == TOGGLE) state.paused = !state.paused;
-                if (c.action == PAUSE) state.paused = true;
-                if (c.action == RESUME) state.paused = false;
-                Serial.printf("AUDIO_CONTROL %s\n", state.paused ? "paused" : "playing");
-            }
-        }
-        uint32_t now = millis();
-        if (state.running && !state.paused) activeMs += now - lastTick;
-        lastTick = now;
-        if (state.running && !state.paused && decoder && !decoder->loop()) {
-            decoder->stop(); state.running = false; Serial.println("AUDIO_FINISHED");
-        }
-        if (source && source->isOpen()) state.position = source->getPos();
-        if (!state.running && !state.failed) state.position = state.bytes;
-        state.elapsed = activeMs / 1000;
-        if (millis() - publishAt >= 50) {
-            publishAt = millis();
-            xSemaphoreTake(stateLock, portMAX_DELAY); audioState = state; xSemaphoreGive(stateLock);
-        }
-        vTaskDelay(pdMS_TO_TICKS(state.running && !state.paused ? 1 : 5));
-    }
-}
 static void sendAction(Action action) {
-    AudioCommand c = {}; c.action = action; xQueueSend(commands, &c, 0);
+    if (!audioReady || booting || transfer!=Transfer::None) return;
+    lastActivity=millis();
+    AudioCommand c = {}; c.action = action;
+    if (!audioSend(c)) ui::setMessage("Busy; try again.");
+}
+static bool playPath(const String &path,bool sd) {
+    if (!audioReady || booting || transfer!=Transfer::None || path.length()>=player::kMaxPath) return false;
+    AudioCommand c = {}; c.action=START; c.sd=sd;
+    strlcpy(c.path,path.c_str(),sizeof(c.path));
+    lastActivity=millis();
+    return audioSend(c);
+}
+// The audio task is the only writer of the gain; this just queues the level.
+static void setVolumeLevel(uint8_t level) {
+    volumeLevel=level>100?100:level;
+    AudioCommand c={}; c.action=SET_VOLUME; c.volume=volumeLevel;
+    audioSend(c); // if the queue is full, the next change (or the slider release) resends
+    volumeDirty=true; volumeChangedAt=millis();
+}
+static void saveVolumeIfIdle() {
+    if(volumeDirty && millis()-volumeChangedAt>=1500) { volumeDirty=false; prefs.putUChar(kVolumeKey,volumeLevel); }
+}
+static void loadVolume() {
+    prefs.begin("player",false);
+    uint8_t level=prefs.getUChar(kVolumeKey,player::kDefaultVolume);
+    if(PLAYER_EARBUDS && level>player::kDefaultVolume) level=player::kDefaultVolume; // never boot louder in earbuds
+    setVolumeLevel(level); volumeDirty=false;
 }
 static void playTrack(int index) {
-    if (tracks.empty()) return;
+    if (booting || tracks.empty()) return;
     selectedTrack = (index + int(tracks.size())) % tracks.size();
-    AudioCommand c = {}; c.action = START; c.sd = tracks[selectedTrack].sd;
-    strlcpy(c.path, tracks[selectedTrack].path.c_str(), sizeof(c.path)); xQueueSend(commands, &c, 0);
+    if (!playPath(tracks[selectedTrack].path,tracks[selectedTrack].sd) && uiReady)
+        ui::setMessage("Cannot queue this song.");
 }
 static void flushDisplay(lv_disp_drv_t *driver, const lv_area_t *area, lv_color_t *pixels) {
     if (screenPixels) {
@@ -222,186 +204,444 @@ static void flushDisplay(lv_disp_drv_t *driver, const lv_area_t *area, lv_color_
     ++flushCount; lv_disp_flush_ready(driver);
 }
 static void readTouch(lv_indev_drv_t *, lv_indev_data_t *data) {
+    const uint32_t now=millis();
+    const bool wasOff=screenMode==player::ScreenMode::Off;
+    const bool pending=Touch_ConsumeInterrupt();
+    if (!pending && !physicalTouch && now-lastTouchProbe<player::kTouchFallbackMs) {
+        data->state=LV_INDEV_STATE_REL; return;
+    }
+    lastTouchProbe=now;
     uint16_t x[5]={}, y[5]={}, strength[5]={}; uint8_t points=0;
-    Touch_Read_Data();
-    bool pressed = Touch_Get_XY(x, y, strength, &points, 5) && points && x[0]<240 && y[0]<320;
+    const bool read=Touch_Read_Data();
+    bool pressed = read && Touch_Get_XY(x, y, strength, &points, 5) && points && x[0]<240 && y[0]<320;
+    physicalTouch=pressed;
     static bool wasPressed = false;
     if (pressed) {
+        lastActivity=now;
+        if (screenMode!=player::ScreenMode::Awake) {
+            if(wasOff) LCD_SetSleep(false);
+            screenMode=player::ScreenMode::Awake;
+            if(wasOff && uiReady) lv_obj_invalidate(lv_scr_act());
+            Set_Backlight(player::kBrightness);
+        }
+    }
+    const bool deliver=wakeGesture.filter(pressed,wasOff);
+    if (deliver) {
         data->point.x=x[0]; data->point.y=y[0]; data->state=LV_INDEV_STATE_PR;
-        if (!wasPressed) { ++touchCount; Serial.printf("TOUCH x=%u y=%u\n", x[0], y[0]); }
+        if (!wasPressed) ++touchCount;
     } else data->state=LV_INDEV_STATE_REL;
     wasPressed = pressed;
-}
-static lv_obj_t *label(lv_obj_t *parent, const char *text, int x, int y, int width, uint32_t color=0xE7EBF2) {
-    lv_obj_t *obj=lv_label_create(parent); lv_label_set_text(obj,text);
-    lv_obj_set_pos(obj,x,y); lv_obj_set_width(obj,width); lv_obj_set_style_text_color(obj,lv_color_hex(color),0);
-    return obj;
-}
-static lv_obj_t *button(lv_obj_t *parent, const char *text, int x, int y, int width, lv_event_cb_t cb) {
-    lv_obj_t *obj=lv_btn_create(parent); lv_obj_set_pos(obj,x,y); lv_obj_set_size(obj,width,44);
-    lv_obj_set_style_bg_color(obj,lv_color_hex(0x294766),0); lv_obj_add_event_cb(obj,cb,LV_EVENT_CLICKED,nullptr);
-    lv_obj_t *caption=lv_label_create(obj); lv_label_set_text(caption,text); lv_obj_center(caption); return caption;
+    if(touchDevice) lv_timer_set_period(touchDevice->driver->read_timer,pressed?15:player::kTouchFallbackMs);
 }
 static void populateBrowser();
-static void showDetails(const Entry &entry) {
-    String text=String("microSD: ")+entry.path+"\n"+String(entry.size)+" bytes";
-    if (!isMp3(entry.path)) text += "\n\nThis test plays MP3 files.";
-    lv_obj_t *box=lv_msgbox_create(nullptr,"File details",text.c_str(),nullptr,true);
-    lv_obj_set_width(box,220); lv_obj_center(box);
-}
-static void fileClicked(lv_event_t *e) {
-    size_t index=reinterpret_cast<uintptr_t>(lv_event_get_user_data(e));
-    if (index>=entries.size()) return;
+static void openItem(size_t index) {
+    if (index>=entries.size() || transfer!=Transfer::None) return;
     Entry entry=entries[index];
     if (entry.directory) { folder=entry.path; populateBrowser(); return; }
     if (isMp3(entry.path)) {
         auto found=std::find_if(tracks.begin(),tracks.end(),[&](const Track &t){return t.sd&&t.path==entry.path;});
-        if (found==tracks.end()) { tracks.push_back({entry.path,true}); found=tracks.end()-1; }
-        playTrack(found-tracks.begin()); lv_tabview_set_act(tabs,0,LV_ANIM_OFF);
-        Serial.printf("UI_FILE_PLAY %s\n",entry.path.c_str());
-    } else showDetails(entry);
+        if (found==tracks.end() && tracks.size()<player::kMaxTracks) {
+            tracks.push_back({entry.path,true}); found=tracks.end()-1;
+        }
+        if (found!=tracks.end()) playTrack(found-tracks.begin());
+        else if (!playPath(entry.path,true)) ui::setMessage("Song path too long or player busy.");
+        ui::showTab(ui::kPlayer);
+    } else {
+        String text=String("microSD: ")+entry.path+"\n"+String(entry.size)+" bytes";
+        text += "\n\nThis player plays MP3 files.";
+        ui::showDetails("File details",text.c_str());
+    }
 }
 static void populateBrowser() {
-    lv_obj_clean(browserList); entries.clear(); lv_label_set_text(folderLabel,folder.c_str());
-    if (!sdReady) {
-        lv_list_add_text(browserList,"microSD could not be mounted.");
-        lv_label_set_text(fileCountLabel,"No files changed; no format performed."); return;
-    }
+    entries.clear();
+    if (!sdReady) { ui::setFiles(folder.c_str(),{},booting?"Reading microSD...":"microSD could not be mounted."); return; }
     File dir=SD_MMC.open(folder);
-    if (!dir || !dir.isDirectory()) { lv_list_add_text(browserList,"Folder unavailable"); return; }
+    if (!dir || !dir.isDirectory()) { ui::setFiles(folder.c_str(),{},"Folder unavailable"); return; }
     File f;
-    while ((f=dir.openNextFile()) && entries.size()<128) {
+    while (entries.size()<128 && (f=dir.openNextFile())) {
         String name=basenameOf(f.name()); String path=folder=="/" ? "/"+name : folder+"/"+name;
+        if (name.startsWith(".")) { f.close(); continue; } // macOS/upload metadata and temp files
         entries.push_back({path,f.isDirectory(),unsigned(f.size())}); f.close();
     }
     dir.close();
     std::sort(entries.begin(),entries.end(),[](const Entry &a,const Entry &b){
         if(a.directory!=b.directory) return a.directory>b.directory; return a.path<b.path;
     });
-    for (size_t i=0;i<entries.size();++i) {
-        const Entry &e=entries[i]; String text=basenameOf(e.path);
-        if(!e.directory) text+="\n"+String(e.size)+" bytes";
-        lv_obj_t *b=lv_list_add_btn(browserList,e.directory?LV_SYMBOL_DIRECTORY:LV_SYMBOL_FILE,text.c_str());
-        lv_obj_set_style_pad_ver(b,12,0); lv_obj_t *caption=lv_obj_get_child(b,-1);
-        lv_label_set_long_mode(caption,LV_LABEL_LONG_WRAP);
-        lv_obj_add_event_cb(b,fileClicked,LV_EVENT_CLICKED,reinterpret_cast<void*>(i));
-    }
-    if(entries.empty()) lv_list_add_text(browserList,"This folder is empty.");
-    String count=String(entries.size())+" items | tap an MP3 to play";
-    if(entries.size()==128) count="First 128 items shown";
-    lv_label_set_text(fileCountLabel,count.c_str());
+    const String playing=snapshot().path;
+    std::vector<ui::FileItem> items; items.reserve(entries.size());
+    for (const Entry &e : entries) items.push_back({basenameOf(e.path).c_str(),e.directory,!e.directory && e.path==playing});
+    String count=String(entries.size())+" ITEMS - TAP A SONG TO PLAY";
+    if(entries.size()==128) count="FIRST 128 ITEMS SHOWN";
+    ui::setFiles(folder.c_str(),items,entries.empty()?"This folder is empty.":count.c_str());
 }
 static void createUI() {
     lv_init(); lv_disp_draw_buf_init(&drawBuffer,drawPixels,nullptr,240*24);
     static lv_disp_drv_t display; lv_disp_drv_init(&display);
     display.hor_res=240; display.ver_res=320; display.draw_buf=&drawBuffer; display.flush_cb=flushDisplay;
     lv_disp_t *disp=lv_disp_drv_register(&display);
-    lv_theme_t *theme=lv_theme_default_init(disp,lv_palette_main(LV_PALETTE_BLUE),lv_palette_main(LV_PALETTE_TEAL),true,&lv_font_montserrat_14);
-    lv_disp_set_theme(disp,theme);
+    // Same theme call as tools/ui_preview; PlayerUi.cpp styles everything on top of it.
+    lv_disp_set_theme(disp,lv_theme_default_init(disp,lv_color_hex(0x9BBC0F),lv_color_hex(0xB0306A),true,&lv_font_montserrat_14));
     static lv_indev_drv_t input; lv_indev_drv_init(&input);
-    input.type=LV_INDEV_TYPE_POINTER; input.read_cb=readTouch; lv_indev_drv_register(&input);
-    tabs=lv_tabview_create(lv_scr_act(),LV_DIR_BOTTOM,42);
-    lv_obj_t *player=lv_tabview_add_tab(tabs,"Player");
-    lv_obj_t *files=lv_tabview_add_tab(tabs,"Files");
-    lv_obj_t *storage=lv_tabview_add_tab(tabs,"Storage");
-    for(lv_obj_t *page : {player,files,storage}) {
-        lv_obj_set_style_pad_all(page,12,0); lv_obj_set_style_bg_color(page,lv_color_hex(0x101923),0);
-        lv_obj_set_style_bg_opa(page,LV_OPA_COVER,0);
-    }
-    lv_obj_clear_flag(player,LV_OBJ_FLAG_SCROLLABLE);
-    label(player,"NOW PLAYING",0,0,210,0x72BEDD);
-    titleLabel=label(player,"Loading music...",0,27,210);
-    lv_obj_set_style_text_font(titleLabel,&lv_font_montserrat_20,0);
-    lv_obj_set_height(titleLabel,52); lv_label_set_long_mode(titleLabel,LV_LABEL_LONG_WRAP);
-    pathLabel=label(player,"",0,84,210,0xA4B5C8);
-    lv_obj_set_height(pathLabel,48); lv_label_set_long_mode(pathLabel,LV_LABEL_LONG_WRAP);
-    positionBar=lv_bar_create(player); lv_obj_set_pos(positionBar,0,139); lv_obj_set_size(positionBar,210,5);
-    lv_bar_set_range(positionBar,0,1000); stateLabel=label(player,"Starting...",0,154,210);
-    button(player,LV_SYMBOL_PREV,0,187,56,[](lv_event_t*){playTrack(selectedTrack-1);});
-    playText=button(player,LV_SYMBOL_PAUSE,65,187,80,[](lv_event_t*){sendAction(TOGGLE);});
-    button(player,LV_SYMBOL_NEXT,154,187,56,[](lv_event_t*){playTrack(selectedTrack+1);});
-    label(player,"Volume: onboard knob",0,236,212,0xA4B5C8);
-    folderLabel=label(files,"/",0,0,150,0x72BEDD); lv_label_set_long_mode(folderLabel,LV_LABEL_LONG_DOT);
-    lv_obj_t *up=lv_btn_create(files); lv_obj_set_pos(up,166,-3); lv_obj_set_size(up,44,28);
-    lv_obj_t *upLabel=lv_label_create(up); lv_label_set_text(upLabel,LV_SYMBOL_UP); lv_obj_center(upLabel);
-    lv_obj_add_event_cb(up,[](lv_event_t*){
+    input.type=LV_INDEV_TYPE_POINTER; input.read_cb=readTouch; touchDevice=lv_indev_drv_register(&input);
+    lv_timer_set_period(input.read_timer,player::kTouchFallbackMs);
+    ui::Actions actions{};
+    actions.previous=[]{ playTrack(selectedTrack-1); };
+    actions.playPause=[]{ sendAction(TOGGLE); };
+    actions.next=[]{ playTrack(selectedTrack+1); };
+    actions.volume=[](uint8_t level){ lastActivity=millis(); setVolumeLevel(level); };
+    actions.openItem=openItem;
+    actions.folderUp=[]{
         int slash=folder.lastIndexOf('/'); folder=slash<=0?"/":folder.substring(0,slash); populateBrowser();
-    },LV_EVENT_CLICKED,nullptr);
-    browserList=lv_list_create(files); lv_obj_set_pos(browserList,0,34); lv_obj_set_size(browserList,212,191);
-    fileCountLabel=label(files,"",0,236,212,0xA4B5C8); populateBrowser();
-    label(storage,"STORAGE",0,0,210,0x72BEDD);
-    String info=sdReady ? "microSD mounted\n"+String(double(sdTotal)/1e9,2)+" GB usable\n"+String(double(sdUsed)/1e6,2)+" MB used\n"+String(double(sdTotal-sdUsed)/1e9,2)+" GB free" : "microSD unavailable\nNo format performed";
-    info+="\n\n"+importResult;
-    if(copiedSong) info+="\n"+importPath+"\n4,007,763 bytes";
-    info+="\n\nInternal flash: 16 MiB\nPSRAM: "+String(ESP.getPsramSize()/1048576.0,1)+" MiB\nUSB-powered speaker test";
-    label(storage,info.c_str(),0,29,210); lv_refr_now(nullptr);
+    };
+    actions.addWifi=[]{ transferRequest=Transfer::Wifi; };
+    actions.addUsb=[]{ transferRequest=Transfer::Usb; };
+    actions.overlayDone=[]{ transferExitRequested=true; };
+    ui::create(actions,usbdrive::supported(),volumeLevel);
+    populateBrowser();
+    uiReady=true;
+    lv_refr_now(nullptr);
+}
+static void updateStorage() {
+    ui::StorageInfo info;
+    info.sdReady=sdReady; info.totalBytes=sdTotal; info.usedBytes=sdUsed; info.songs=tracks.size();
+    info.note=importResult.c_str();
+    if(copiedSong) info.note+=std::string(" ")+importPath.c_str();
+    if(scanLimited) info.note+=" More files in Library.";
+    info.psramMiB=ESP.getPsramSize()/1048576.0f;
+    ui::setStorage(info);
 }
 static void refreshPlayer() {
-    AudioState s=snapshot(); String name=basenameOf(s.path);
-    if(name.endsWith(".mp3")) name.remove(name.length()-4);
-    lv_label_set_text(titleLabel,name.length()?name.c_str():"No MP3 selected");
-    String origin=String(s.sd?"microSD: ":"Internal flash: ")+s.path;
-    lv_label_set_text(pathLabel,origin.c_str());
-    char text[90];
-    snprintf(text,sizeof(text),"%s  %u:%02u  |  %.2f MB",s.failed?"Failed":s.paused?"Paused":s.running?"Playing":"Stopped",s.elapsed/60,s.elapsed%60,s.bytes/1e6);
-    lv_label_set_text(stateLabel,text); lv_label_set_text(playText,s.running&&!s.paused?LV_SYMBOL_PAUSE:LV_SYMBOL_PLAY);
-    lv_bar_set_value(positionBar,s.bytes?uint64_t(s.position)*1000/s.bytes:0,LV_ANIM_OFF);
+    if(booting || screenMode==player::ScreenMode::Off || ui::activeTab()!=ui::kPlayer) return;
+    const AudioState state=snapshot();
+    static char oldPath[player::kMaxPath]={}, title[128]="", artist[96]="";
+    static bool oldSd=false, cached=false;
+    if(!cached || strcmp(oldPath,state.path) || oldSd!=state.sd) {
+        cached=true;
+        strlcpy(oldPath,state.path,sizeof(oldPath)); oldSd=state.sd;
+        String name=basenameOf(String(state.path));
+        if(isMp3(name)) name.remove(name.length()-4);
+        if(!name.length()) { strlcpy(title,"No MP3 selected",sizeof(title)); artist[0]=0; }
+        else player::splitTrackName(name.c_str(),artist,sizeof(artist),title,sizeof(title));
+        if(!artist[0] && name.length()) { // no "Artist - Title": show where it lives
+            const String path=state.path; const int slash=path.lastIndexOf('/');
+            const String parent=slash>0 ? basenameOf(path.substring(0,slash)) : "";
+            strlcpy(artist,!state.sd?"Internal flash":parent.length()?parent.c_str():"microSD",sizeof(artist));
+        }
+    }
+    ui::NowPlaying now;
+    now.title=title; now.artist=state.failed?state.error:artist;
+    now.state=state.failed?"ERROR":state.paused?"PAUSED":state.running?"PLAYING":"STOPPED";
+    char detail[16]; snprintf(detail,sizeof(detail),state.bytes?"%.2f MB":"",state.bytes/1e6); now.detail=detail;
+    now.playing=state.running&&!state.paused; now.elapsed=state.elapsed;
+    now.permille=state.bytes?uint64_t(state.position)*1000/state.bytes:0;
+    now.tracks=tracks.size();
+    now.track=selectedTrack>=0 && selectedTrack<int(tracks.size()) && tracks[selectedTrack].path==state.path ? selectedTrack+1 : 0;
+    if(!now.track) now.tracks=0;
+    ui::setNowPlaying(now);
 }
+static void wakeScreen() {
+    lastActivity=millis();
+    if(screenMode==player::ScreenMode::Off) {
+        LCD_SetSleep(false); lv_obj_invalidate(lv_scr_act());
+    }
+    screenMode=player::ScreenMode::Awake;
+    Set_Backlight(player::kBrightness);
+}
+static void applyScreenPolicy() {
+    if(booting) return;
+    const auto mode=player::screenMode(millis(),lastActivity,player::kDimAfterMs,player::kScreenOffAfterMs);
+    if(mode==screenMode) return;
+    if(mode==player::ScreenMode::Off) {
+        LCD_SetSleep(true); screenMode=mode;
+    } else {
+        if(screenMode==player::ScreenMode::Off) { LCD_SetSleep(false); lv_obj_invalidate(lv_scr_act()); }
+        screenMode=mode;
+        Set_Backlight(mode==player::ScreenMode::Dim?player::kDimBrightness:player::kBrightness);
+    }
+}
+// ---- Library rescan (after songs were added) ------------------------------------
+static void rescanLibrary() {
+    const String current=selectedTrack>=0 && selectedTrack<int(tracks.size()) ? tracks[selectedTrack].path : "";
+    tracks.clear(); musicScanned=false; scannedEntries=0; scanLimited=false; scanStartedAt=millis();
+    if(sdReady) {
+        scanMusic(player::kMusicFolder); scanMusic("/");
+        sdTotal=SD_MMC.totalBytes(); sdUsed=SD_MMC.usedBytes();
+    }
+    if(tracks.empty() && flashReady && LittleFS.exists("/test.mp3")) tracks.push_back({"/test.mp3",false});
+    std::sort(tracks.begin(),tracks.end(),[](const Track &a,const Track &b){return a.path.compareTo(b.path)<0;});
+    selectedTrack=0;
+    for(size_t i=0;i<tracks.size();++i) if(tracks[i].path==current) selectedTrack=int(i);
+    importResult=String(tracks.size())+" songs in the library.";
+    populateBrowser(); updateStorage();
+    Serial.printf("LIBRARY_RESCANNED songs=%u\n",unsigned(tracks.size()));
+}
+
+// ---- Add music overlay (Wi-Fi QR codes / USB drive) -----------------------------
+static void stopWifi();
+static void updateWifiOverlay(const upload::Status &s) {
+    char line[112]="", corner[16];
+    const uint32_t left=player::sessionSecondsLeft(millis(),s.lastActivityMs,player::kUploadIdleTimeoutMs);
+    snprintf(corner,sizeof(corner),"%u:%02u",unsigned(left/60),unsigned(left%60));
+    if(s.receiving && s.bytesExpected)
+        snprintf(line,sizeof(line),"%u%%  %s",unsigned(uint64_t(s.bytesReceived)*100/s.bytesExpected),s.currentFile);
+    else if(s.lastMessage[0]) snprintf(line,sizeof(line),"%s",s.lastMessage);
+    else if(s.filesSaved) snprintf(line,sizeof(line),"%u added",unsigned(s.filesSaved));
+    ui::setWifiStatus(line,corner);
+    // Once a phone has joined, move on to the page code (unless someone flipped it by hand).
+    if(s.stations) ui::stationJoined();
+}
+static void startWifi() {
+    if(!sdReady) { ui::setAddHint("No microSD card, so there is nowhere to save songs."); return; }
+    sendAction(PAUSE); // Wi-Fi runs on the audio core; pause instead of risking dropouts.
+    transfer=Transfer::Wifi; transferExitRequested=false;
+    transferStartedAt=transferUiAt=millis();
+    ui::openWifi(player::kWifiName,player::kWifiPassword,upload::kUrl); lv_refr_now(nullptr);
+    const bool ok=upload::begin();
+    Serial.printf("WIFI_UPLOAD %s heap=%u\n",ok?"ON":"FAILED",ESP.getFreeHeap());
+    if(!ok) { stopWifi(); ui::setAddHint("Wi-Fi could not start. Try again."); }
+}
+static void stopWifi() {
+    const upload::Status s=upload::status();
+    upload::end();
+    ui::closeOverlay(); transfer=Transfer::None; transferExitRequested=false;
+    if(s.filesSaved) rescanLibrary();
+    else { sdUsed=SD_MMC.usedBytes(); updateStorage(); }
+    lastActivity=millis();
+    Serial.printf("WIFI_UPLOAD OFF added=%u\n",unsigned(s.filesSaved));
+}
+static void startUsb() {
+    if(!usbdrive::supported()) return;
+    if(!sdReady) { ui::setAddHint("No microSD card to share over USB."); return; }
+    // The computer will write raw sectors: the audio task must close its song file first.
+    if(audioReady) {
+        const uint32_t before=snapshot().releases;
+        AudioCommand c={}; c.action=RELEASE;
+        bool released=audioSend(c);
+        for(int i=0; released && i<200 && snapshot().releases==before; ++i) delay(10);
+        if(!released || snapshot().releases==before) { ui::setAddHint("Player busy; try USB again."); return; }
+    }
+    transfer=Transfer::Usb; usbCancelArmed=false; transferExitRequested=false; usbEjectedAt=0;
+    transferStartedAt=transferUiAt=millis();
+    ui::openUsb(); lv_refr_now(nullptr);
+    Serial.println("USB_DRIVE ON (this serial port disappears until the player restarts)");
+    Serial.flush(); delay(50);
+    const char *error=nullptr;
+    if(!usbdrive::begin(&error)) ui::setUsbStatus(error?error:"USB drive could not start.");
+}
+static void serviceUsb() {
+    const uint32_t now=millis();
+    if(usbdrive::ejected()) {
+        if(!usbEjectedAt) { usbEjectedAt=now; ui::setUsbStatus("Ejected. Restarting with the new songs..."); }
+        else if(now-usbEjectedAt>=1500) usbdrive::restartPlayer();
+        return;
+    }
+    if(transferExitRequested) {
+        transferExitRequested=false;
+        if(usbdrive::hostAccessed() && !usbCancelArmed) {
+            usbCancelArmed=true;
+            ui::setUsbStatus("Eject it on the computer first! Tap Cancel again to restart anyway.");
+        } else usbdrive::restartPlayer();
+        return;
+    }
+    if(!usbdrive::hostAccessed() && player::sessionExpired(now,transferStartedAt,player::kUploadIdleTimeoutMs))
+        usbdrive::restartPlayer(); // tapped by accident, never plugged in
+    if(!usbCancelArmed)
+        ui::setUsbStatus(usbdrive::hostAccessed() ? "Computer connected. Eject it there when done." :
+                                                                   "Waiting for a computer...");
+}
+static void serviceTransfer() {
+    if(transferRequest!=Transfer::None) {
+        const Transfer request=transferRequest; transferRequest=Transfer::None;
+        if(transfer==Transfer::None && !booting) {
+            if(request==Transfer::Wifi) startWifi(); else startUsb();
+        }
+    }
+    if(transfer==Transfer::None) return;
+    lastActivity=millis(); // keep the screen on while a code or instructions are shown
+    if(transfer==Transfer::Usb) { serviceUsb(); return; }
+    const uint32_t now=millis();
+    if(transferExitRequested) { stopWifi(); return; }
+    if(now-transferUiAt<500) return;
+    transferUiAt=now;
+    const upload::Status s=upload::status();
+    if(s.doneRequested || (!s.receiving && player::sessionExpired(now,s.lastActivityMs,player::kUploadIdleTimeoutMs))) {
+        stopWifi(); return;
+    }
+    updateWifiOverlay(s);
+}
+
+// ---- Physical buttons --------------------------------------------------------------
+static constexpr player::ButtonTiming kButtonTiming{player::kButtonDebounceMs,player::kButtonDoubleGapMs,player::kButtonLongMs};
+// A button with no double/long mapping reacts on release instead of waiting out the double-click window.
+static player::ButtonGesture buttonA(kButtonTiming,
+    player::kButtonADouble==player::ButtonAction::None && player::kButtonALong==player::ButtonAction::None);
+static player::ButtonGesture buttonB(kButtonTiming,
+    player::kButtonBDouble==player::ButtonAction::None && player::kButtonBLong==player::ButtonAction::None);
+static void IRAM_ATTR buttonInterrupt() {
+    BaseType_t woken=pdFALSE;
+    if(uiTaskHandle) vTaskNotifyGiveFromISR(uiTaskHandle,&woken);
+    if(woken) portYIELD_FROM_ISR();
+}
+static void runButtonAction(player::ButtonAction action) {
+    using A=player::ButtonAction;
+    if(action==A::None || booting || transfer!=Transfer::None) return;
+    if(action==A::WakeScreen) { wakeScreen(); return; }
+    const uint32_t keep=lastActivity; // media buttons work with the screen off and don't wake it
+    if(action==A::PlayPause) sendAction(TOGGLE);
+    else if(action==A::Next) playTrack(selectedTrack+1);
+    else if(action==A::Previous) playTrack(selectedTrack-1);
+    else if(action==A::Restart) playTrack(selectedTrack);
+    else if(action==A::VolumeUp || action==A::VolumeDown) {
+        const int step=action==A::VolumeUp ? player::kVolumeStep : -int(player::kVolumeStep);
+        setVolumeLevel(uint8_t(std::max(0,std::min(100,int(volumeLevel)+step)))); ui::setVolume(volumeLevel);
+    }
+    lastActivity=keep;
+}
+static void dispatchButton(player::ButtonEvent event,player::ButtonAction single,player::ButtonAction twice,player::ButtonAction hold) {
+    if(event==player::ButtonEvent::Single) runButtonAction(single);
+    else if(event==player::ButtonEvent::Double) runButtonAction(twice);
+    else if(event==player::ButtonEvent::Long) runButtonAction(hold);
+}
+static void setupButtons() {
+    for(int pin : {player::kButtonAPin,player::kButtonBPin}) {
+        if(pin<0) continue;
+        pinMode(pin,INPUT_PULLUP); // replaces UART0 TX/RX on these pads
+        attachInterrupt(pin,buttonInterrupt,CHANGE);
+    }
+}
+// Returns true while a click decision still depends on time passing.
+static bool pollButtons() {
+    const uint32_t now=millis();
+    bool pending=false;
+    if(player::kButtonAPin>=0) {
+        dispatchButton(buttonA.update(digitalRead(player::kButtonAPin)==LOW,now),
+                       player::kButtonASingle,player::kButtonADouble,player::kButtonALong);
+        pending|=buttonA.pending();
+    }
+    if(player::kButtonBPin>=0) {
+        dispatchButton(buttonB.update(digitalRead(player::kButtonBPin)==LOW,now),
+                       player::kButtonBSingle,player::kButtonBDouble,player::kButtonBLong);
+        pending|=buttonB.pending();
+    }
+    return pending;
+}
+
 static void serialCommand(const String &line) {
+    if(line=="status" || line=="metrics") {
+        const AudioState state=snapshot();
+        const upload::Status wifi=upload::status();
+        Serial.printf("STATUS storage=%s path=%s state=%s position=%u/%u elapsed=%u flushes=%u touches=%u heap=%u boot_ms=%u screen=%u i2s_writes=%u frames=%u read_refills=%u audio_slices=%u transfer=%u volume=%u gain_q12=%u http_requests=%u stations=%u error=%s\n",
+            state.sd?"microSD":"internal",state.path,state.failed?"failed":state.paused?"paused":state.running?"playing":"stopped",
+            state.position,state.bytes,state.elapsed,flushCount,touchCount,ESP.getFreeHeap(),readyMs,unsigned(screenMode),
+            state.writes,state.frames,state.readCalls,state.slices,unsigned(transfer),unsigned(state.volume),unsigned(state.gainQ12),
+            unsigned(wifi.httpRequests),unsigned(wifi.stations),state.error);
+        return;
+    }
+    if(transfer==Transfer::Usb) return; // the card belongs to the computer until restart
+    if(line=="wifi-on") { transferRequest=Transfer::Wifi; return; }
+    if(line=="wifi-off") { if(transfer==Transfer::Wifi) transferExitRequested=true; return; }
+    if(line=="usb-drive") { transferRequest=Transfer::Usb; return; }
+    if(line=="rescan") { if(transfer==Transfer::None) rescanLibrary(); return; }
+    if(line=="screen-off") {
+        lastActivity=millis()-player::kScreenOffAfterMs; applyScreenPolicy(); return;
+    }
+    wakeScreen();
     if(line=="pause") sendAction(PAUSE);
     else if(line=="play") sendAction(RESUME);
     else if(line=="next") playTrack(selectedTrack+1);
     else if(line=="prev") playTrack(selectedTrack-1);
-    else if(line=="files") lv_tabview_set_act(tabs,1,LV_ANIM_OFF);
-    else if(line=="storage") lv_tabview_set_act(tabs,2,LV_ANIM_OFF);
-    else if(line=="player") lv_tabview_set_act(tabs,0,LV_ANIM_OFF);
-    else if(line=="music") { folder="/Music"; populateBrowser(); lv_tabview_set_act(tabs,1,LV_ANIM_OFF); }
-    else if(line=="shot" && screenPixels) {
-        lv_refr_now(nullptr); Serial.println("FRAME_BEGIN 240 320 RGB565BE");
+    else if(line=="files") ui::showTab(ui::kLibrary);
+    else if(line=="add") ui::showTab(ui::kAdd);
+    else if(line=="storage" || line=="info") ui::showTab(ui::kInfo);
+    else if(line=="player") ui::showTab(ui::kPlayer);
+    else if(line=="music" && transfer==Transfer::None) { folder="/Music"; populateBrowser(); ui::showTab(ui::kLibrary); }
+    else if(line=="shot") {
+        // Allocate/copy the diagnostic framebuffer only while taking a shot.
+        screenPixels=static_cast<uint16_t*>(ps_calloc(240*320,2));
+        if(!screenPixels) { Serial.println("FRAME_ERROR no framebuffer memory"); return; }
+        refreshPlayer(); lv_obj_invalidate(lv_scr_act()); lv_refr_now(nullptr);
+        Serial.println("FRAME_BEGIN 240 320 RGB565BE");
         Serial.write(reinterpret_cast<uint8_t*>(screenPixels),240*320*2); Serial.println("\nFRAME_END");
-    }
-    else if(line=="status") {
-        AudioState s=snapshot();
-        Serial.printf("STATUS storage=%s path=%s state=%s position=%u/%u elapsed=%u flushes=%u touches=%u heap=%u\n",s.sd?"microSD":"internal",s.path,s.paused?"paused":s.running?"playing":"stopped",s.position,s.bytes,s.elapsed,flushCount,touchCount,ESP.getFreeHeap());
+        free(screenPixels); screenPixels=nullptr;
     }
 }
 void setup() {
     pinMode(7,OUTPUT); digitalWrite(7,LOW); // Preserve the USB-only test's power behavior.
-    pinMode(5,OUTPUT); digitalWrite(5,LOW); Serial.begin(115200); delay(1500);
-    Serial.printf("\nWAVESHARE SD PLAYER TEST | flash=%u PSRAM=%u\n",ESP.getFlashChipSize(),ESP.getPsramSize());
-    screenPixels=static_cast<uint16_t*>(ps_calloc(240*320,2));
-    LCD_Init(); Backlight_Init(); Set_Backlight(50);
-    flashReady=LittleFS.begin(false);
+    pinMode(5,OUTPUT); digitalWrite(5,LOW); Serial.begin(115200);
+    lastActivity=millis();
+    uiTaskHandle=xTaskGetCurrentTaskHandle();
+    audioReady=audioBegin(uiTaskHandle);
+    loadVolume();
+    LCD_Init(); Touch_SetWakeTask(xTaskGetCurrentTaskHandle());
+    Backlight_Init(); Set_Backlight(player::kBrightness);
+    tracks.reserve(player::kMaxTracks); entries.reserve(128);
+    createUI(); // A visible UI before card scans or imports; no fixed USB wait.
+    setupButtons();
     pinMode(21,OUTPUT); digitalWrite(21,HIGH); delay(10); SD_MMC.setPins(14,17,16);
     sdReady=SD_MMC.begin("/sdcard",true,false,20000,8);
     if(sdReady && SD_MMC.cardType()!=CARD_NONE) {
+        scanStartedAt=millis();
+        scanMusic("/Music"); // Prioritize songs before unrelated game/save folders.
+        scanMusic("/");
+        // One filesystem-stat pass; no repeated song hashes on normal boots.
         sdTotal=SD_MMC.totalBytes(); sdUsed=SD_MMC.usedBytes();
-        Serial.printf("SD_MOUNT_OK card_bytes=%llu filesystem_bytes=%llu used_bytes=%llu\n",SD_MMC.cardSize(),sdTotal,sdUsed);
-        File root=SD_MMC.open("/"); File f;
-        while((f=root.openNextFile())) {
-            Serial.printf("SD_EXISTING %s %s bytes=%u\n",f.isDirectory()?"DIR":"FILE",f.name(),unsigned(f.size())); f.close();
-        }
-        root.close(); importSong(); sdUsed=SD_MMC.usedBytes(); scanMusic("/");
-    } else { sdReady=false; importResult="microSD mount failed. Card not formatted."; Serial.println("SD_MOUNT_FAILED no formatting performed"); }
-    if(copiedSong) {
-        auto found=std::find_if(tracks.begin(),tracks.end(),[](const Track &t){return t.path==importPath;});
-        if(found!=tracks.end()) selectedTrack=found-tracks.begin();
+        if(tracks.empty()) {
+            flashReady=LittleFS.begin(false); importSong();
+            if(copiedSong) { tracks.push_back({importPath,true}); sdUsed=SD_MMC.usedBytes(); }
+        } else importResult="Songs loaded from microSD.";
+    } else { sdReady=false; importResult="microSD unavailable; no formatting performed."; }
+    if(tracks.empty()) {
+        if(!flashReady) flashReady=LittleFS.begin(false);
+        if(flashReady && LittleFS.exists("/test.mp3")) tracks.push_back({"/test.mp3",false});
     }
-    if(tracks.empty() && flashReady && LittleFS.exists("/test.mp3")) tracks.push_back({"/test.mp3",false});
-    Serial.printf("PLAYLIST mp3_count=%u import=%s\n",unsigned(tracks.size()),importResult.c_str());
-    commands=xQueueCreate(6,sizeof(AudioCommand)); stateLock=xSemaphoreCreateMutex();
-    createUI(); xTaskCreatePinnedToCore(audioTask,"mp3",12288,nullptr,2,nullptr,0); playTrack(selectedTrack);
-    Serial.println("UI_READY tabs=Player,Files,Storage backlight=50% commands=status,pause,play,next,prev,files,music,storage,player,shot");
+    std::sort(tracks.begin(),tracks.end(),[](const Track &a,const Track &b){return a.path.compareTo(b.path)<0;});
+    const auto found=std::find_if(tracks.begin(),tracks.end(),[](const Track &track){return track.path=="/Music/TLC - No Scrubs.mp3";});
+    if(found!=tracks.end()) selectedTrack=found-tracks.begin();
+    booting=false; populateBrowser(); updateStorage(); playTrack(selectedTrack);
+    if(!audioReady) ui::setMessage("Audio task could not start.");
+    readyMs=millis(); lastActivity=millis();
+    if(Serial) Serial.printf("UI_READY boot_ms=%u songs=%u cpu_mhz=%u\n",readyMs,unsigned(tracks.size()),getCpuFrequencyMhz());
 }
 void loop() {
-    static uint32_t refreshedAt=0, reportedAt=0; static String command;
-    while(Serial.available()) {
-        char c=Serial.read();
+    static uint32_t refreshedAt=0; static String command;
+    static const bool reserved=command.reserve(128); (void)reserved;
+    // Bound host input processing, so a noisy serial client cannot starve touch.
+    for(unsigned read=0; read<64 && Serial.available(); ++read) {
+        const char c=Serial.read();
         if(c=='\n') { command.trim(); serialCommand(command); command=""; }
         else if(c!='\r' && command.length()<128) command+=c;
     }
-    if(millis()-refreshedAt>=300) { refreshedAt=millis(); refreshPlayer(); }
-    lv_timer_handler();
-    if(millis()-reportedAt>=5000) { reportedAt=millis(); serialCommand("status"); }
-    delay(3);
+    serviceTransfer();
+    saveVolumeIfIdle();
+    const bool buttonsPending=pollButtons();
+    applyScreenPolicy();
+    uint32_t waitMs=player::kTouchFallbackMs;
+    if(screenMode==player::ScreenMode::Off) {
+        lv_indev_data_t ignored={}; readTouch(nullptr,&ignored);
+    }
+    if(screenMode!=player::ScreenMode::Off) {
+        if(Touch_interrupts && touchDevice) lv_timer_ready(touchDevice->driver->read_timer);
+        if(millis()-refreshedAt>=player::kUiUpdateMs) { refreshedAt=millis(); refreshPlayer(); }
+        lv_disp_t *display=lv_disp_get_default();
+        if(display->inv_p || physicalTouch || lv_anim_count_running()) {
+            lv_timer_resume(display->refr_timer);
+            if(display->inv_p) lv_timer_ready(display->refr_timer);
+        }
+        waitMs=lv_timer_handler();
+        if(display->inv_p) { // Input callbacks may just have created a dirty region.
+            lv_timer_resume(display->refr_timer); lv_timer_ready(display->refr_timer);
+            waitMs=lv_timer_handler();
+        }
+        if(!display->inv_p && !physicalTouch && !lv_anim_count_running()) lv_timer_pause(display->refr_timer);
+        const uint32_t elapsed=millis()-refreshedAt;
+        const uint32_t uiDelay=elapsed>=player::kUiUpdateMs?0:player::kUiUpdateMs-elapsed;
+        if(waitMs>uiDelay) waitMs=uiDelay;
+    }
+    if(waitMs>player::kTouchFallbackMs) waitMs=player::kTouchFallbackMs;
+    if(transfer!=Transfer::None && waitMs>100) waitMs=100; // progress text + timeouts
+    if(buttonsPending && waitMs>10) waitMs=10;            // debounce / double-click timing
+    if(volumeDirty && waitMs>100) waitMs=100;              // save the volume once it settles
+    if(waitMs<1 || Serial.available()) waitMs=1;
+    // Touch ISR wakes this wait immediately; no fixed 3 ms GUI polling loop.
+    ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(waitMs));
 }

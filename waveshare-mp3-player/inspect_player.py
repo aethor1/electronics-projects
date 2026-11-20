@@ -48,6 +48,9 @@ try:
         marker = b'FRAME_BEGIN 240 320 RGB565BE\r\n'
         while time.monotonic() < end:
             data.extend(port.read(port.in_waiting or 1))
+            if b'FRAME_ERROR' in data:
+                captured.extend(data)
+                raise RuntimeError('The player could not allocate its temporary screenshot buffer')
             offset = data.find(marker)
             if offset >= 0 and len(data) >= offset + len(marker) + 153600:
                 captured.extend(data[:offset])
