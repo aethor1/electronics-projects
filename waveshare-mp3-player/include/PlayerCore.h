@@ -25,17 +25,31 @@ public:
 private:
     bool suppress_ = false;
 };
-inline int16_t amplify(int32_t sample, uint8_t gainQ6) {
-    const int32_t product = sample * gainQ6;
-    const int32_t value = product >= 0 ? product / 64 : -((-product + 63) / 64);
+// Gain is Q12 (4096 = unity). Q12 = old Q6 * 64 gives bit-identical output (floor division).
+inline int16_t amplify(int32_t sample, uint16_t gainQ12) {
+    const int32_t product = sample * gainQ12;
+    const int32_t value = product >= 0 ? product / 4096 : -((-product + 4095) / 4096);
     return int16_t(value < -32767 ? -32767 : value > 32767 ? 32767 : value);
 }
-inline uint32_t packPcm(int16_t left, int16_t right, uint8_t gainQ6, bool mono) {
+inline uint32_t packPcm(int16_t left, int16_t right, uint16_t gainQ12, bool mono) {
     if (mono) {
         const int32_t sum = int32_t(left) + right;
         left = right = int16_t(sum >= 0 ? sum / 2 : -((-sum + 1) / 2));
     }
-    return (uint32_t(uint16_t(amplify(right, gainQ6))) << 16) | uint16_t(amplify(left, gainQ6));
+    return (uint32_t(uint16_t(amplify(right, gainQ12))) << 16) | uint16_t(amplify(left, gainQ12));
+}
+// Volume 0..100 -> Q12 gain on a cubic (≈ audio taper) curve: 100 = maxGainQ12, 50 = -18 dB.
+inline uint16_t volumeGainQ12(uint8_t level, uint16_t maxGainQ12) {
+    if (level > 100) level = 100;
+    return uint16_t((uint64_t(level) * level * level * maxGainQ12 + 500000) / 1000000);
+}
+
+// "Artist - Title" file names split for display; anything else is all title.
+inline void splitTrackName(const char *name, char *artist, size_t artistSize, char *title, size_t titleSize) {
+    const char *dash = strstr(name, " - ");
+    if (!dash || dash == name || !dash[3]) { snprintf(artist, artistSize, "%s", ""); snprintf(title, titleSize, "%s", name); return; }
+    snprintf(artist, artistSize, "%.*s", int(dash - name), name);
+    snprintf(title, titleSize, "%s", dash + 3);
 }
 
 // A sample is accepted exactly once, even when the sink makes partial writes.

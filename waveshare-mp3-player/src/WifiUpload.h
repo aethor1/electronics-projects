@@ -13,6 +13,7 @@ struct Status {
     uint8_t stations = 0;         // phones/Macs joined to the player's Wi-Fi
     uint32_t lastActivityMs = 0;  // last HTTP request or upload chunk
     uint32_t filesSaved = 0;
+    uint32_t httpRequests = 0;    // every request this session (diagnostics)
     uint32_t bytesReceived = 0, bytesExpected = 0;
     char currentFile[64] = {};
     char lastMessage[80] = {};

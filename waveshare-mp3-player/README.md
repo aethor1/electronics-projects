@@ -1,8 +1,15 @@
 # Waveshare touchscreen MP3 player
 
 **Feature branch `feature/wifi-usb-upload`:** Wi-Fi upload with QR codes, USB drive
-mode, two physical buttons, an earbuds build, and a Mac companion app. Compile and
-host-test checked only; see [ADD-MUSIC.md](ADD-MUSIC.md) and [mac-app](mac-app/README.md).
+mode, two physical buttons, an earbuds build, and a Mac companion app. `241abed` boots and
+plays on the board. **2026-11-20 update (not flashed yet):** upload-page fix (DNS +
+connectivity probes), on-screen volume saved across reboots, redesigned UI. What changed and
+what to check on the board: [ADD-MUSIC.md](ADD-MUSIC.md#2026-11-20-update-what-changed).
+
+![New UI, rendered from the firmware's UI code on a PC](docs/ui/overview.png)
+
+UI screenshots: `python tools/ui_preview/run.py` builds `src/PlayerUi.cpp` + LVGL on Linux with a
+dummy display and writes `docs/ui/*.png` (2x pixel-doubled).
 
 **Local optimization branch:** the current changes are build/host-test checked,
 but have **not been flashed, tested on hardware, or pushed**. The physically
@@ -130,7 +137,7 @@ python inspect_player.py --port COM15 --command storage --screenshot logs\storag
 ```
 
 Commands: `status`, `pause`, `play`, `next`, `prev`, `player`, `files`, `music`,
-`storage`, `shot`, `metrics`, `screen-off`, `wake`. Status output is now requested
+`storage`, `shot`, `metrics`, `screen-off`, `wake` (plus the Add-music ones in ADD-MUSIC.md). Status output is now requested
 explicitly, without periodic logging. The helper captures rendered pixels; a PNG alone does not
 prove the physical display works. Audio, touch, and the final LCD fix were also
 confirmed by the user. Helpers close the serial port when finished.

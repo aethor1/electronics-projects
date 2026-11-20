@@ -37,6 +37,7 @@ void worker(void *) {
     AudioGeneratorMP3 decoder(decoderMemory,sizeof(decoderMemory));
     BatchedI2S output;
     AudioState state;
+    state.gainQ12=output.gainQ12();
     bool attached=false;
     uint32_t lastTick=millis(), publishedAt=0;
     uint64_t activeMs=0;
@@ -56,8 +57,9 @@ void worker(void *) {
         strlcpy(state.error,message,sizeof(state.error));
     };
     auto start=[&](const char *path,bool sd) {
-        const uint32_t releases=state.releases;
-        stop(); state=AudioState{}; state.sd=sd; state.releases=releases;
+        const AudioState kept=state;
+        stop(); state=AudioState{}; state.sd=sd; state.releases=kept.releases;
+        state.volume=kept.volume; state.gainQ12=kept.gainQ12;
         strlcpy(state.path,path,sizeof(state.path));
         source=sd ? &sdSource : &flashSource;
         activeMs=0; lastTick=millis();
@@ -80,7 +82,10 @@ void worker(void *) {
         lastTick=now;
         if(received) {
             do {
-                if(command.action==RELEASE) {
+                if(command.action==SET_VOLUME) {
+                    state.volume=command.volume>100 ? 100 : command.volume;
+                    output.setVolume(state.volume); state.gainQ12=output.gainQ12();
+                } else if(command.action==RELEASE) {
                     stop(); state.running=false; state.paused=false; ++state.releases;
                 } else if(command.action==START) start(command.path,command.sd);
                 else if(!state.running && state.path[0] && command.action!=PAUSE) {

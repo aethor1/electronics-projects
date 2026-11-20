@@ -1,4 +1,5 @@
 #include "WifiUpload.h"
+#include <DNSServer.h>
 #include <SD_MMC.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -52,6 +53,7 @@ fetch('/api/done',{method:'POST'}).finally(()=>{document.body.innerHTML='<h1>All
 SemaphoreHandle_t lock = nullptr;
 Status shared;
 WebServer *server = nullptr;
+DNSServer dns;
 TaskHandle_t serverTask = nullptr;
 volatile bool stopRequested = false;
 uint64_t freeBytes = 0;
@@ -88,6 +90,33 @@ String urlDecode(const String &in) {
     }
     return out;
 }
+
+// First in the handler chain: WebServer asks every handler in order until one matches,
+// so this sees each request exactly once. Counting is not "activity": once phones think
+// the network is online, background app traffic must not keep Wi-Fi on forever.
+class RequestLog : public RequestHandler {
+    bool canHandle(HTTPMethod method, String uri) override {
+        const char *name = method == HTTP_GET ? "GET" : method == HTTP_POST ? "POST" : method == HTTP_PUT ? "PUT" :
+                           method == HTTP_HEAD ? "HEAD" : "OTHER";
+        Serial.printf("HTTP %s %s\n", name, uri.c_str());
+        update([](Status &s) { ++s.httpRequests; });
+        return false;
+    }
+};
+
+// OS "is there internet?" probes (DNS sends every name here). Answering them the way
+// the real servers do makes phones keep using this Wi-Fi instead of mobile data, and
+// avoids the captive-portal mini-browser (bad at file pickers on iOS).
+struct Probe { const char *path, *type, *body; int code; };
+const Probe kProbes[] = {
+    {"/generate_204", "text/plain", "", 204},  // Android / Chrome
+    {"/gen_204", "text/plain", "", 204},
+    {"/hotspot-detect.html", "text/html", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>", 200},  // Apple
+    {"/library/test/success.html", "text/html", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>", 200},
+    {"/connecttest.txt", "text/plain", "Microsoft Connect Test", 200},  // Windows
+    {"/ncsi.txt", "text/plain", "Microsoft NCSI", 200},
+    {"/success.txt", "text/plain", "success\n", 200},  // Firefox
+};
 
 void sendJson(int code, const String &body) {
     server->sendHeader("Cache-Control", "no-store");
@@ -292,6 +321,7 @@ void removeStaleTempFiles() {
 void serverLoop(void *) {
     uint32_t polledAt = 0;
     while (!stopRequested) {
+        dns.processNextRequest();
         server->handleClient();
         if (millis() - polledAt >= 500) {
             polledAt = millis();
@@ -323,17 +353,23 @@ bool begin() {
     WiFi.persistent(false);
     if (!WiFi.mode(WIFI_AP)) return false;
     const IPAddress ip(192, 168, 4, 1), mask(255, 255, 255, 0);
-    WiFi.softAPConfig(ip, ip, mask);
-    // Channel 6, visible, at most a phone + a Mac at once.
-    if (!WiFi.softAP(player::kWifiName, player::kWifiPassword, 6, 0, 2)) {
+    // Channel 6, visible, at most a phone + a Mac at once. (Order is fine on 2.0.17:
+    // softAP() only sets the radio config; softAPConfig() sets IP + DHCP.)
+    if (!WiFi.softAPConfig(ip, ip, mask) || !WiFi.softAP(player::kWifiName, player::kWifiPassword, 6, 0, 2)) {
         WiFi.mode(WIFI_OFF);
         return false;
     }
     WiFi.setTxPower(WIFI_POWER_11dBm);  // a desk-range link; less current than the 20 dBm default
+    // Answer every name with our IP: the phone's DHCP DNS is us, so connectivity probes
+    // reach the handlers below, and http://mp3.player/ works too.
+    if (!dns.start(53, "*", ip)) Serial.println("DNS server could not start");
 
     server = new WebServer(80);
     static const char *headers[] = {"X-File-Name", "Content-Length"};
     server->collectHeaders(headers, 2);
+    server->addHandler(new RequestLog);  // must stay first
+    for (const Probe &probe : kProbes)
+        server->on(probe.path, HTTP_GET, [&probe] { server->send(probe.code, probe.type, probe.body); });
     server->on("/", HTTP_GET, [] { touch(); server->send_P(200, "text/html", kPage); });
     server->on("/api/status", HTTP_GET, handleStatus);
     server->on("/api/files", HTTP_GET, handleFiles);
@@ -364,6 +400,7 @@ void end() {
     if (!serverTask) {
         delete server;
         server = nullptr;
+        dns.stop();  // only once the server task (its only user) is gone
         resetUpload();
         if (up.buffer) { free(up.buffer); up.buffer = nullptr; }
     }

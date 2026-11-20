@@ -5,6 +5,7 @@
 #include "vendor/Display_ST7789.h"
 #include <algorithm>
 #include <assert.h>
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <random>
@@ -113,9 +114,41 @@ static void testPcm() {
         auto ref=[&](int32_t sample) { int32_t n=(sample*gain)>>6; return uint16_t(std::max(-32767,std::min(32767,n))); };
         if(mono) { const int16_t m=(int32_t(l)+r)>>1; l=r=m; }
         const uint32_t expected=(uint32_t(ref(r))<<16)|ref(l);
-        // Test the same original inputs for the production formatter.
-        check(player::packPcm(originalLeft,originalRight,gain,mono)==expected,"gain, stereo packing, saturation and mono match baseline");
+        // Old Q6 gain g == Q12 gain g*64: same bits, same saturation, same mono mix.
+        check(player::packPcm(originalLeft,originalRight,uint16_t(gain*64),mono)==expected,"Q12 gain matches the Q6 baseline bit for bit");
     }
+    for(unsigned i=0;i<100000;++i) {
+        const int16_t s=random(); const uint16_t g=random()%(player::kUnityGainQ12+1);
+        const int32_t a=player::amplify(s,g);
+        check(std::abs(a)<=std::abs(int32_t(s)) && std::abs(a)<=32767,"gain <= unity never boosts or clips");
+    }
+    check(player::amplify(-32768,player::kUnityGainQ12)==-32767 && player::amplify(12345,player::kUnityGainQ12)==12345,"unity is transparent (symmetric clamp)");
+}
+static void testVolume() {
+    using namespace player;
+    for(uint16_t max : {kSpeakerMaxGainQ12,kEarbudMaxGainQ12,kUnityGainQ12}) {
+        check(volumeGainQ12(0,max)==0 && volumeGainQ12(100,max)==max,"curve endpoints");
+        for(unsigned v=1;v<=100;++v) check(volumeGainQ12(v,max)>=volumeGainQ12(v-1,max),"curve never decreases");
+        for(unsigned v=101;v<=255;++v) check(volumeGainQ12(v,max)==max,"levels above 100 clamp to the max");
+    }
+    auto dB=[](double a,double b){ return 20*std::log10(a/b); };
+    check(std::fabs(dB(volumeGainQ12(kSpeakerDefaultVolume,kSpeakerMaxGainQ12),5*64))<0.25,"speaker default = old 5/64 loudness");
+    check(std::fabs(dB(volumeGainQ12(kEarbudDefaultVolume,kEarbudMaxGainQ12),2*64))<0.25,"earbud default = old 2/64 loudness");
+    check(kEarbudMaxGainQ12==kEarbudMaxGainQ6*64 && kEarbudMaxGainQ12==320,"earbud cap unchanged (5/64)");
+    check(kSpeakerMaxGainQ12<=kUnityGainQ12,"speaker never above unity");
+    check(std::fabs(dB(volumeGainQ12(50,4096),4096)+18.06)<0.1,"half volume is about -18 dB");
+    BatchedI2S output;
+    check(output.gainQ12()==volumeGainQ12(kDefaultVolume,kMaxGainQ12),"adapter starts at the build default");
+    output.setVolume(255); check(output.gainQ12()==kMaxGainQ12,"adapter clamps to this build's cap");
+    check(!output.SetGain(4.0f) && output.gainQ12()==kMaxGainQ12,"library SetGain cannot bypass the cap");
+    char artist[32], title[32];
+    splitTrackName("TLC - No Scrubs",artist,sizeof(artist),title,sizeof(title));
+    check(!strcmp(artist,"TLC") && !strcmp(title,"No Scrubs"),"artist - title split");
+    splitTrackName("Intro",artist,sizeof(artist),title,sizeof(title));
+    check(!artist[0] && !strcmp(title,"Intro"),"no dash: all title");
+    splitTrackName(" - x",artist,sizeof(artist),title,sizeof(title));
+    check(!artist[0] && !strcmp(title," - x"),"leading dash is not an artist");
+    std::cout<<"volume_default_gain_q12="<<volumeGainQ12(kDefaultVolume,kMaxGainQ12)<<" max_q12="<<kMaxGainQ12<<'\n';
 }
 static void testActualAudioOutput() {
     pcmBytes.clear(); writeCalls=installs=uninstalls=0; writeLimit=SIZE_MAX;
@@ -126,7 +159,7 @@ static void testActualAudioOutput() {
         for(unsigned i=0;i<44100;++i) {
             if(i%player::kPcmSliceFrames==0) output.beginSlice();
             int16_t sample[2]={int16_t(i*17),int16_t(-int(i*11))};
-            const uint32_t packed=player::packPcm(sample[0],sample[1],player::kGainQ6,player::kMonoOutput);
+            const uint32_t packed=player::packPcm(sample[0],sample[1],output.gainQ12(),player::kMonoOutput);
             const auto *bytes=reinterpret_cast<const uint8_t*>(&packed); expected.insert(expected.end(),bytes,bytes+4);
             check(output.ConsumeSample(sample),"actual audio accepts a valid slice");
         }
@@ -217,6 +250,6 @@ static void testButtons() {
       check(e.size()==2 && e[0]==ButtonEvent::Single && e[1]==ButtonEvent::Single,"slow clicks are two singles"); }
 }
 int main() {
-    testPolicy(); testTags(); testReadAhead(); testBatch(); testPcm(); testActualAudioOutput(); testActualLcd(); testTransfer(); testButtons();
-    std::cout<<"PASS: core, PCM fidelity, short writes, I2S lifecycle, ID3 bounds, read-ahead, sleep/wake, LCD protocol, upload names, buttons\n";
+    testPolicy(); testTags(); testReadAhead(); testBatch(); testPcm(); testVolume(); testActualAudioOutput(); testActualLcd(); testTransfer(); testButtons();
+    std::cout<<"PASS: core, PCM fidelity, volume curve/cap, short writes, I2S lifecycle, ID3 bounds, read-ahead, sleep/wake, LCD protocol, upload names, buttons\n";
 }

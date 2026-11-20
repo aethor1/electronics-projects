@@ -6,15 +6,15 @@
 
 class BatchedI2S final : public AudioOutput {
 public:
-    BatchedI2S() { hertz=44100; bps=16; channels=2; gainF2P6=player::kGainQ6; }
+    BatchedI2S() { hertz=44100; bps=16; channels=2; }
     ~BatchedI2S() override { stop(); if (installed_) i2s_driver_uninstall(I2S_NUM_0); }
     bool begin() override;
     bool SetRate(int hz) override;
     bool SetBitsPerSample(int bits) override { if(bits!=16) return false; bps=bits; return true; }
-    // ESP8266Audio's SetGain wraps 4.0 to 0; clamp to this build's configured gain instead.
-    bool SetGain(float f) override {
-        const float q=f*64.0f; gainF2P6=q<=0 ? 0 : q>=player::kGainQ6 ? player::kGainQ6 : uint8_t(q); return true;
-    }
+    // The library's Q6 SetGain is ignored: only setVolume() (audio task) changes the gain.
+    bool SetGain(float) override { return false; }
+    void setVolume(uint8_t level) { gainQ12_=player::volumeGainQ12(level,player::kMaxGainQ12); }
+    uint16_t gainQ12() const { return gainQ12_; }
     bool SetChannels(int count) override { if(count!=1 && count!=2) return false; channels=count; return true; }
     bool ConsumeSample(int16_t sample[2]) override;
     bool stop() override;
@@ -30,5 +30,6 @@ private:
     player::PcmBatch<player::kPcmBatchFrames> batch_;
     bool installed_=false, active_=false, failed_=false;
     unsigned budget_=0;
+    uint16_t gainQ12_=player::volumeGainQ12(player::kDefaultVolume,player::kMaxGainQ12);
     uint32_t writes_=0, frames_=0;
 };
